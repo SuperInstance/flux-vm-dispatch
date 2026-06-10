@@ -1,6 +1,6 @@
 # flux-vm-dispatch
 
-Miniature Flux bytecode VM producing GPU command dispatches. Tests flux-core to cudaclaw synergy.
+Miniature Flux bytecode VM producing GPU command dispatches. Tests flux-core to cudaclaw integration.
 
 ## Why This Matters
 

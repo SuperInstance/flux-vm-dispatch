@@ -1,93 +1,125 @@
-# flux-vm-dispatch
+# flux-vm-dispatch: GPU Command Dispatch from Flux Bytecode
 
-Miniature Flux bytecode VM producing GPU command dispatches. Tests flux-core to cudaclaw integration.
+A miniature virtual machine that interprets Flux bytecode instructions and translates them into GPU command dispatches. It bridges `flux-core`'s bytecode semantics with the `cudaclaw` command queue, testing the full pipeline from high-level agent instructions down to GPU kernel launches.
 
-## Why This Matters
+## Why It Matters
 
-# flux-vm-dispatch
-Miniature Flux bytecode VM that interprets ops and produces GPU command dispatches.
-Tests how flux-core's bytecode would actually drive cudaclaw's command queue.
+The gap between "an agent decides to compute something" and "a GPU actually runs the kernel" is where many frameworks break down. This crate proves the interface is sound by implementing a complete dispatch loop: every arithmetic or memory operation in the Flux ISA maps to a concrete GPU command. It also introduces **balanced ternary** arithmetic (Z₃), enabling exploration of ternary computing on binary GPU hardware.
 
-## The Five-Layer Stack
+## How It Works
 
-This crate is part of the **Oxide Stack** — a distributed GPU runtime built on five layers:
+### Instruction Set
+
+The VM supports a compact instruction set with both binary and ternary operations:
+
+| Instruction | Operands | GPU Dispatch | Semantics |
+|-------------|----------|-------------|-----------|
+| `MOVI` | reg, imm | — | Load immediate |
+| `ADD` | rd, rs1, rs2 | `KernelLaunch("iadd", 256)` | rd = rs1 + rs2 |
+| `SUB` | rd, rs1, rs2 | `KernelLaunch("isub", 256)` | rd = rs1 − rs2 |
+| `TADD` | rd, ra, rb | `KernelLaunch("ternary_add", 256)` | Z₃ addition |
+| `TMUL` | rd, ra, rb | `KernelLaunch("ternary_mul", 256)` | Z₃ multiplication |
+| `SYNC` | — | `BarrierSync` | Global synchronization |
+| `LOAD` | rd, addr | `MemCopy(addr → rd, 4B)` | Memory load |
+| `STORE` | addr, rs | `MemCopy(rs → addr, 4B)` | Memory store |
+| `HALT` | — | — | Stop execution |
+
+### Balanced Ternary Arithmetic (Z₃)
+
+The ternary operations implement arithmetic over Z₃ = {−1, 0, +1}, the **balanced ternary** number system studied by Brusentsov:
+
+**Addition table (TADD):**
+
+| + | −1 | 0 | +1 |
+|---|-----|---|-----|
+| **−1** | +1 | −1 | 0 |
+| **0** | −1 | 0 | +1 |
+| **+1** | 0 | +1 | −1 |
+
+**Multiplication table (TMUL):**
+
+| × | −1 | 0 | +1 |
+|---|-----|---|-----|
+| **−1** | +1 | 0 | −1 |
+| **0** | 0 | 0 | 0 |
+| **+1** | −1 | 0 | +1 |
+
+This forms a ring isomorphic to ℤ/3ℤ under the mapping {−1 → 2, 0 → 0, +1 → 1}.
+
+### VM State
 
 ```
-┌─────────────────┐
-│  cudaclaw        │  Persistent GPU kernels, warp consensus, SmartCRDT
-├─────────────────┤
-│  cuda-oxide      │  Flux → MIR → Pliron → NVVM → PTX compiler
-├─────────────────┤
-│  flux-core       │  Bytecode VM + A2A agent protocol
-├─────────────────┤
-│  pincher         │  "Vector DB as runtime, LLM as compiler"
-├─────────────────┤
-│  open-parallel   │  Async runtime (tokio fork)
-└─────────────────┘
+registers: [i32; 16]    // 16 general-purpose registers
+memory:    [i32; 256]   // 256-word addressable memory
+pc:        usize        // program counter
+halted:    bool         // execution flag
+sync_count: u32         // barrier operations
 ```
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+### Complexity
 
-## Design
+| Operation | Time | Dispatch |
+|-----------|------|----------|
+| `MOVI` | O(1) | None |
+| `ADD`/`SUB` | O(1) | One kernel launch |
+| `TADD`/`TMUL` | O(1) | One kernel launch |
+| `LOAD`/`STORE` | O(1) | One MemCopy |
+| `SYNC` | O(1) | One BarrierSync |
+| Full program (n ops) | O(n) | Up to n GPU commands |
 
-Every value in this crate follows **ternary algebra** (Z₃):
-
-| Value | Meaning | GPU Analog |
-|-------|---------|------------|
-| +1 | Positive / Active / Healthy | Warp vote yes |
-| 0 | Neutral / Pending / Balanced | Warp vote abstain |
-| -1 | Negative / Failed / Overloaded | Warp vote no |
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary LLMs at 60% less power
-2. **GPU warp voting** — hardware ballot returns ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity
-
-## Key Types
+## Quick Start
 
 ```rust
-pub enum Op
-pub enum GpuCmd
-pub struct VmState
-pub struct FluxVm
-pub fn new
-pub fn load_program
-pub fn step
-pub fn run
-pub fn state
-pub fn trace
-pub fn ops_executed
-pub fn dispatch_count
+use flux_vm_dispatch::{FluxVm, Op, GpuCmd};
+
+let program = vec![
+    Op::MOVI { reg: 0, imm: 1 },
+    Op::MOVI { reg: 1, imm: -1 },
+    Op::TADD { rd: 2, ra: 0, rb: 1 },  // 1 + (-1) = 0 in Z₃
+    Op::SYNC,
+    Op::HALT,
+];
+
+let mut vm = FluxVm::new();
+let cmds = vm.run(&program);
+
+assert_eq!(vm.state().registers[2], 0);  // Z₃ result
+assert!(cmds.iter().any(|c| matches!(c, GpuCmd::BarrierSync)));
 ```
 
-## Usage
+## API
 
-```toml
-[dependencies]
-flux-vm-dispatch = "0.1.0"
+### `FluxVm`
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new` | `() -> Self` | Initialize with default state |
+| `load_program` | `(&mut self, &[Op])` | Pre-load memory with simulated data |
+| `step` | `(&mut self, &Op) -> Option<GpuCmd>` | Execute one instruction, return dispatch |
+| `run` | `(&mut self, &[Op]) -> Vec<GpuCmd>` | Execute full program |
+| `state` | `(&self) -> &VmState` | Read-only VM state |
+| `trace` | `(&self) -> &[String]` | Human-readable execution log |
+| `ops_executed` | `(&self) -> u64` | Instruction count |
+| `dispatch_count` | `(&self) -> usize` | GPU commands queued |
+
+### `GpuCmd`
+
+```
+KernelLaunch { name: String, threads: u32 }
+BarrierSync
+MemCopy { src: u8, dst: u8, size: u32 }
 ```
 
-```rust
-use flux_vm_dispatch::*;
-// See src/lib.rs tests for complete working examples
-```
+## Architecture Notes
 
-## Testing
+This crate sits at the **γ/η boundary** in the γ + η = C framework. The VM dispatch logic is **γ** — it is deterministic, with fixed opcode-to-GPU-command mappings. The dispatch queue that receives these commands (in `cudaclaw`) is **η** — it reorders, batches, and schedules them. The `TADD`/`TMUL` operations are particularly interesting as they encode **Information–Physics duality**: balanced ternary is the most efficient radix for computation (radix economy e ≈ 2.718), connecting information theory to physical implementation.
 
-```bash
-git clone https://github.com/SuperInstance/flux-vm-dispatch.git
-cd flux-vm-dispatch
-cargo test    # 7 tests
-```
+## References
 
-## Stats
-
-| Metric | Value |
-|--------|-------|
-| Tests | 7 |
-| Lines of Rust | 237 |
-| Public API | 12 items |
+- Brusentsov, N. P. (1958). *The Computer "Setun"*. Moscow University Press.
+- Knuth, D. E. (1997). *The Art of Computer Programming, Vol. 2* (3rd ed.), §4.1. Addison-Wesley.
+- Frieder, G. & Luk, C. (1975). *Ternary Computers*. Proc. ACM Annual Conf.
 
 ## License
 
-Apache-2.0
+MIT
